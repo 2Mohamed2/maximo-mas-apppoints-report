@@ -1,0 +1,1636 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<report xmlns="http://www.eclipse.org/birt/2005/design" version="3.2.23" id="1">
+    <property name="createdBy">Eclipse BIRT Designer Version 4.3.1.v201309091055 Build &lt;4.3.1.v20130918-1142></property>
+    <html-property name="description">MAS AppPoint estimate (Magic Script 2.6.3 logic, read-only)</html-property>
+    <property name="units">in</property>
+    <method name="initialize"><![CDATA[importPackage(Packages.com.ibm.tivoli.maximo.report.script);
+mxReportScriptContext = MXReportScriptContext.initialize(reportContext);
+scriptLogger = mxReportScriptContext.getReportScriptLogger();
+daysBack = parseInt(params["Days_Back"].value);
+ownedAP = parseInt(params["Owned_AppPoints"].value);
+if (isNaN(ownedAP) || ownedAP < 0) ownedAP = 0;
+if (isNaN(daysBack) || daysBack < 1) daysBack = 90;
+if (daysBack > 730) daysBack = 730;
+
+
+function dbKind(ds) {
+  var n = String(ds.getDatabaseProductName()).toLowerCase();
+  if (n.indexOf("oracle") >= 0) return "oracle";
+  if (n.indexOf("microsoft") >= 0 || n.indexOf("sql server") >= 0) return "sqlserver";
+  return "db2";
+}
+// Read-only port of IBM Magic Script 2.6.3. Same user-type rules, no tables or indexes created.
+// One builder, three dialects: "oracle", "sqlserver", "db2" (Maximo 7.6 supported databases).
+function magicSql(daysBack, db) {
+  db = db || "oracle";
+  var ORA = db == "oracle", MSS = db == "sqlserver", DB2 = db == "db2";
+
+  // ---- dialect helpers
+  function cat() {                       // string concatenation of 2+ expressions
+    var a = Array.prototype.slice.call(arguments);
+    if (MSS) return "concat(" + a.join(", ") + ")";
+    return "(" + a.join(" || ") + ")";
+  }
+  function str(x) { return MSS ? "cast(" + x + " as varchar(20))" : (ORA ? "to_char(" + x + ")" : "varchar(" + x + ")"); }
+  function daysAgo(n) { return ORA ? "(sysdate - " + n + ")" : (MSS ? "dateadd(day, -" + n + ", getdate())" : "(current timestamp - " + n + " days)"); }
+  function dayOf(x) { return ORA ? "trunc(" + x + ")" : (MSS ? "cast(" + x + " as date)" : "date(" + x + ")"); }
+  function nextDay(x) { return ORA ? "(" + x + " + 1)" : (MSS ? "dateadd(day, 1, " + x + ")" : "(" + x + " + 1 days)"); }
+  function fmtStamp(x) { return MSS ? "convert(varchar(16), " + x + ", 120)" : "to_char(" + x + ", 'YYYY-MM-DD HH24:MI')"; }
+  function fmtDay(x) { return MSS ? "convert(varchar(10), " + x + ", 120)" : "to_char(" + x + ", 'YYYY-MM-DD')"; }
+  function fmtShort(x) { return MSS ? "convert(varchar(9), " + x + ", 6)" : "to_char(" + x + ", 'DD Mon YY')"; }
+  var NL = MSS ? "char(10)" : "chr(10)";
+  var DUAL = ORA ? " from dual" : (DB2 ? " from sysibm.sysdummy1" : "");
+  // Comma list per key. `src` returns distinct (k, v) pairs.
+  function listOf(src) {
+    if (MSS) return " (select s1.k, stuff((select ', ' + s2.v from (" + src + ") s2 where s2.k = s1.k order by s2.v"
+      + " for xml path('')), 1, 2, '') v from (select distinct k from (" + src + ") s0) s1) ";
+    return " (select k, listagg(v, ', ') within group (order by v) v from (" + src + ") s group by k) ";
+  }
+
+  var SS_EXCL   = "'PLUSCONDRE','PLUSDSPLAN','PLUSCTMPLT','PLUSTVR','PLUSGCRINC','PLUSGVWINC','PLUSGMCR','PLUSPPBILL','TLOAMSWCTG','SFWLICVIEW','CONTSFW','BBOARD','KPI','SRMOBILE'";
+  var MOD_EXCL  = "'PLUSCONDRE','PLUSDSPLAN','PLUSCTMPLT','PLUSTVR','PLUSGCRINC','PLUSGVWINC','PLUSGMCR','PLUSPPBILL','TLOAMSWCTG','SFWLICVIEW','CONTSFW','BBOARD','KPI'";
+  var RES_EXCL  = "'PLUSCONDRE','TLOAMSWCTG','SFWLICVIEW','CONTSFW','BBOARD','KPI'";
+  var PLUS_EXCL = "'PLUSCONDRE','PLUSDSPLAN','PLUSCTMPLT','PLUSTVR','PLUSGCRINC','PLUSGMCR','PLUSPPBILL','PLUSGVWINC'";
+  var PLUS_SRC  = "select distinct g.userid k, a.app v from groupuser g join applicationauth a on a.groupname = g.groupname"
+    + " where a.optionname = 'INSERT' and a.app like 'PLUS%' and a.app not in (" + PLUS_EXCL + ")";
+  var o = {};
+
+  // One row per active/blocked user with the MAS user type and AppPoints.
+  o.users =
+      " musers as (select u.userid, u.personid, u.status, u.type from maxuser u"
+    + "   where u.status in (select value from synonymdomain where domainid = 'MAXUSERSTATUS' and maxvalue in ('ACTIVE','BLOCKED'))),"
+    + " gam as (select distinct g.userid, a.app, a.optionname, m.moduleapp from groupuser g"
+    + "   join applicationauth a on a.groupname = g.groupname"
+    + "   join maxmenu m on m.elementtype = 'APP' and m.menutype = 'MODULE' and m.keyvalue = a.app"
+    + "   where a.optionname in ('READ','INSERT','SAVE') and a.app not like '%CONFIG'),"
+    + " nonss as (select distinct userid from gam where optionname = 'READ' and app not in (" + SS_EXCL + ")"
+    + "   and moduleapp not in ('ANALYTICS','REPORTING','HIDDEN','SSDR','SSDR1','SSDR2')),"
+    + " modcnt as (select userid, count(distinct moduleapp) nmod from gam where optionname = 'INSERT' and app not in (" + MOD_EXCL + ")"
+    + "   and moduleapp not in ('ANALYTICS','REPORTING','HIDDEN','SSDR','SSDR1','SSDR2','WO') group by userid),"
+    + " restr as (select distinct userid from gam where optionname = 'SAVE' and app not in (" + RES_EXCL + ")"
+    + "   and moduleapp in ('SCHEDULER','SETUP','INT','UTIL','SECURITY')),"
+    + " plusu as (select pl.k userid, pl.v plusapps from" + listOf(PLUS_SRC) + "pl),"
+    + " cls as (select u.userid, u.personid, u.status, u.type, coalesce(mc.nmod, 0) nmod,"
+    + "   case when r.userid is not null then 'Y' else 'N' end restricted, p.plusapps,"
+    + "   case when n.userid is null then 'SELFSERVICE'"
+    + "        when coalesce(mc.nmod, 0) <= 3 and r.userid is null then 'LIMITED'"
+    + "        when p.userid is not null then 'PREMIUM' else 'BASE' end mastype"
+    + "   from musers u left join nonss n on n.userid = u.userid left join modcnt mc on mc.userid = u.userid"
+    + "   left join restr r on r.userid = u.userid left join plusu p on p.userid = u.userid),"
+    + " clsp as (select c.*, case mastype when 'LIMITED' then 5 when 'BASE' then 10 when 'PREMIUM' then 15 else 0 end points from cls c)";
+
+  // Sessions and the 3 peak concurrent-user moments (on different days) in the window.
+  o.peaks =
+      " sess as (select maxsessionuid, userid,"
+    + "   min(case when attemptresult = 'LOGIN' then attemptdate end) logindate,"
+    + "   min(case when attemptresult in ('LOGOUT','RESTART','SYSLOGOUT','TIMEOUT') then attemptdate end) logoutdate"
+    + "   from logintracking where attemptdate >= " + daysAgo(daysBack + 1) + " and maxsessionuid is not null"
+    + "   and userid not in ('MAXADMIN','MXINTADM','MAXREG') group by maxsessionuid, userid),"
+    + " daily as (select " + dayOf("attemptdate") + " d, max(currentcount) cc from logintracking"
+    + "   where attemptdate >= " + daysAgo(daysBack) + " and currentcount is not null group by " + dayOf("attemptdate") + "),"
+    + " top3 as (select d, cc, row_number() over (order by cc desc, d desc) rn from daily),"
+    + " peaks as (select t.rn peakno, t.cc, (select min(x.attemptdate) from logintracking x"
+    + "   where x.attemptdate >= t.d and x.attemptdate < " + nextDay("t.d") + " and x.currentcount = t.cc) peakdate from top3 t where t.rn <= 3),"
+    + " peakusers as (select distinct p.peakno, p.peakdate, p.cc, s.userid from peaks p join sess s"
+    + "   on s.logindate <= p.peakdate and s.logoutdate >= p.peakdate)";
+
+  var TIERS = MSS
+    ? " tiers as (select * from (values ('PREMIUM','Premium',1,15), ('BASE','Base',2,10), ('LIMITED','Limited',3,5),"
+      + " ('SELFSERVICE','Self service',4,0)) v (mastype, label, sk, pe))"
+    : " tiers as (select 'PREMIUM' mastype, 'Premium' label, 1 sk, 15 pe" + DUAL
+      + " union all select 'BASE', 'Base', 2, 10" + DUAL
+      + " union all select 'LIMITED', 'Limited', 3, 5" + DUAL
+      + " union all select 'SELFSERVICE', 'Self service', 4, 0" + DUAL + ")";
+
+  // Per peak: users and AppPoints split by tier.
+  var PEAKAGG = " peakagg as (select p.peakno, p.peakdate, p.cc, count(pu.userid) users_at_peak,"
+    + " sum(case when c.mastype = 'PREMIUM' then 1 else 0 end) premium,"
+    + " sum(case when c.mastype = 'BASE' then 1 else 0 end) base,"
+    + " sum(case when c.mastype = 'LIMITED' then 1 else 0 end) limited,"
+    + " sum(case when pu.userid is not null and (c.mastype = 'SELFSERVICE' or c.mastype is null) then 1 else 0 end) selfservice,"
+    + " coalesce(sum(c.points), 0) points"
+    + " from peaks p left join peakusers pu on pu.peakno = p.peakno left join clsp c on c.userid = pu.userid"
+    + " group by p.peakno, p.peakdate, p.cc),"
+    + " toppeak as (select users_at_peak, peakdate from (select users_at_peak, peakdate,"
+    + "   row_number() over (order by points desc, peakno) rn from peakagg) z where rn = 1)";
+
+  // One row of headline numbers for the KPI tiles.
+  o.kpiSql = "with " + o.users + "," + o.peaks + "," + PEAKAGG
+    + " select (select count(*) from clsp) active_users,"
+    + " (select count(*) from clsp where mastype <> 'SELFSERVICE') paying_users,"
+    + " (select count(*) from clsp where mastype = 'SELFSERVICE') free_users,"
+    + " (select coalesce(sum(points), 0) from clsp) auth_points,"
+    + " (select coalesce(max(points), 0) from peakagg) peak_points,"
+    + " (select max(users_at_peak) from toppeak) peak_users,"
+    + " (select max(" + fmtStamp("peakdate") + ") from toppeak) peak_date,"
+    + " (select coalesce(max(cc), 0) from peakagg) peak_count" + DUAL;
+
+  // Always four rows, so the charts and the tier guide show every tier.
+  o.typesSql = "with " + o.users + "," + TIERS
+    + " select t.mastype, t.label, t.sk, t.pe pointseach, count(c.userid) users, coalesce(sum(c.points), 0) points"
+    + " from tiers t left join clsp c on c.mastype = t.mastype"
+    + " group by t.mastype, t.label, t.sk, t.pe order by t.sk";
+
+  o.peaksSql = "with " + o.users + "," + o.peaks + "," + PEAKAGG
+    + " select peakno, " + cat("'#'", str("peakno"), "'  '", fmtShort("peakdate"), NL, "'Total '", str("points"), "' AP'") + " peaklabel,"
+    + " " + fmtStamp("peakdate") + " peakdate, cc currentcount, users_at_peak,"
+    + " premium, base, limited, selfservice, premium * 15 premium_pts, base * 10 base_pts, limited * 5 limited_pts, points"
+    + " from peakagg order by peakno";
+
+  o.peakUsersSql = "with " + o.users + "," + o.peaks
+    + " select pu.peakno, " + cat("'Peak '", str("pu.peakno"), "' - '", fmtStamp("pu.peakdate")) + " peaklabel,"
+    + " pu.userid, coalesce(pe.displayname, pu.userid) displayname, coalesce(c.mastype, 'NOT ACTIVE') mastype, coalesce(c.points, 0) points"
+    + " from peakusers pu left join clsp c on c.userid = pu.userid left join person pe on pe.personid = c.personid"
+    + " order by pu.peakno, coalesce(c.points, 0) desc, pu.userid";
+
+  // Security groups that give Premium users their add-on (PLUS*) create rights.
+  var GPLUS_SRC = "select distinct a.groupname k, a.app v from applicationauth a"
+    + " where a.optionname = 'INSERT' and a.app like 'PLUS%' and a.app not in (" + PLUS_EXCL + ")";
+  o.premGroupsSql = "with " + o.users + ","
+    + " gprem as (select g.groupname, count(distinct c.userid) premium_users from groupuser g"
+    + "   join clsp c on c.userid = g.userid and c.mastype = 'PREMIUM'"
+    + "   where g.groupname in (select gs.k from (" + GPLUS_SRC + ") gs) group by g.groupname)"
+    + " select gp.groupname, mg.description, gp.premium_users, gl.v plusapps"
+    + " from gprem gp left join maxgroup mg on mg.groupname = gp.groupname"
+    + " left join" + listOf(GPLUS_SRC) + "gl on gl.k = gp.groupname"
+    + " order by gp.premium_users desc, gp.groupname offset 0 rows fetch next 15 rows only";
+
+  o.usersSql = "with " + o.users + "," + TIERS
+    + " select c.userid, pe.displayname, c.status, c.type, c.mastype, t.label tierlabel, t.sk tiersort, c.points, c.nmod, c.restricted, c.plusapps,"
+    + " " + fmtDay("ll.lastlogin") + " lastlogin"
+    + " from clsp c join tiers t on t.mastype = c.mastype left join person pe on pe.personid = c.personid"
+    + " left join (select userid, max(attemptdate) lastlogin from logintracking where attemptresult = 'LOGIN' group by userid) ll on ll.userid = c.userid"
+    + " order by t.sk, c.userid";
+
+  // Plain user -> type list, used to compare with IBM's original script.
+  o.typeListSql = "with " + o.users + " select userid, mastype from clsp order by userid";
+  return o;
+}
+
+]]></method>
+    <method name="afterFactory"><![CDATA[MXReportScriptContext.close();]]></method>
+    <text-property name="displayName">MAS AppPoint Estimate</text-property>
+    <property name="layoutPreference">auto layout</property>
+    <list-property name="libraries">
+        <structure>
+            <property name="fileName">MaximoSystemLibrary.rptlibrary</property>
+            <property name="namespace">MaximoSystemLibrary</property>
+        </structure>
+    </list-property>
+    <parameters>
+        <scalar-parameter name="Days_Back" id="414"><text-property name="promptText">Peak window (days)</text-property><text-property name="helpText">How many days of login history to search for peaks. 1 to 730.</text-property>
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property><simple-property-list name="defaultValue"><value type="constant">90</value></simple-property-list>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="Owned_AppPoints" id="415"><text-property name="promptText">Owned AppPoints</text-property><text-property name="helpText">Your MAS AppPoint entitlement. Leave 0 to skip the headroom tile.</text-property>
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property><simple-property-list name="defaultValue"><value type="constant">0</value></simple-property-list>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="where" id="416">
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property><simple-property-list name="defaultValue"><value type="constant">1=1</value></simple-property-list>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="appname" id="417">
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="paramdelimiter" id="418"><property name="hidden">true</property>
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="paramstring" id="419"><property name="hidden">true</property>
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+        <scalar-parameter name="usepagebreaks" id="420"><property name="hidden">true</property>
+            <property name="valueType">static</property>
+            <property name="isRequired">false</property>
+            <property name="dataType">string</property><simple-property-list name="defaultValue"><value type="constant">true</value></simple-property-list>
+            <property name="paramType">simple</property>
+            <property name="controlType">text-box</property>
+            <structure name="format"><property name="category">Unformatted</property></structure>
+        </scalar-parameter>
+    </parameters>
+    <data-sources><script-data-source name="maximoDataSource" id="101" extends="MaximoSystemLibrary.maximoDataSource"/>
+    </data-sources>
+    <data-sets>
+        <script-data-set name="dsKpi" id="102">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">active_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">paying_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">free_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">auth_points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">peak_points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">peak_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">peak_date</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">peak_count</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">active_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">paying_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">free_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">auth_points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">peak_points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">peak_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">peak_date</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">peak_count</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsKpiDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsKpiDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsKpiDS)).kpiSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsKpi sql = " + sqlText);
+dsKpiDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsKpiDS.fetch()) return (false);
+row["active_users"] = dsKpiDS.getInteger("active_users");
+row["paying_users"] = dsKpiDS.getInteger("paying_users");
+row["free_users"] = dsKpiDS.getInteger("free_users");
+row["auth_points"] = dsKpiDS.getInteger("auth_points");
+row["peak_points"] = dsKpiDS.getInteger("peak_points");
+row["peak_users"] = dsKpiDS.getInteger("peak_users");
+row["peak_date"] = dsKpiDS.getString("peak_date");
+row["peak_count"] = dsKpiDS.getInteger("peak_count");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsKpiDS.close();]]></method>
+        </script-data-set>
+        <script-data-set name="dsTypes" id="103">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">label</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">sk</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">pointseach</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">label</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">sk</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">pointseach</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsTypesDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsTypesDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsTypesDS)).typesSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsTypes sql = " + sqlText);
+dsTypesDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsTypesDS.fetch()) return (false);
+row["mastype"] = dsTypesDS.getString("mastype");
+row["label"] = dsTypesDS.getString("label");
+row["sk"] = dsTypesDS.getInteger("sk");
+row["pointseach"] = dsTypesDS.getInteger("pointseach");
+row["users"] = dsTypesDS.getInteger("users");
+row["points"] = dsTypesDS.getInteger("points");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsTypesDS.close();]]></method>
+        </script-data-set>
+        <script-data-set name="dsPeaks" id="104">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">peakno</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">peaklabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">peakdate</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">currentcount</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">users_at_peak</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">premium</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">base</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">limited</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">9</property>
+                    <property name="name">selfservice</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">10</property>
+                    <property name="name">premium_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">11</property>
+                    <property name="name">base_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">12</property>
+                    <property name="name">limited_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">13</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">peakno</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">peaklabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">peakdate</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">currentcount</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">users_at_peak</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">premium</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">base</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">limited</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">9</property>
+                    <property name="name">selfservice</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">10</property>
+                    <property name="name">premium_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">11</property>
+                    <property name="name">base_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">12</property>
+                    <property name="name">limited_pts</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">13</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsPeaksDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsPeaksDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsPeaksDS)).peaksSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsPeaks sql = " + sqlText);
+dsPeaksDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsPeaksDS.fetch()) return (false);
+row["peakno"] = dsPeaksDS.getInteger("peakno");
+row["peaklabel"] = dsPeaksDS.getString("peaklabel");
+row["peakdate"] = dsPeaksDS.getString("peakdate");
+row["currentcount"] = dsPeaksDS.getInteger("currentcount");
+row["users_at_peak"] = dsPeaksDS.getInteger("users_at_peak");
+row["premium"] = dsPeaksDS.getInteger("premium");
+row["base"] = dsPeaksDS.getInteger("base");
+row["limited"] = dsPeaksDS.getInteger("limited");
+row["selfservice"] = dsPeaksDS.getInteger("selfservice");
+row["premium_pts"] = dsPeaksDS.getInteger("premium_pts");
+row["base_pts"] = dsPeaksDS.getInteger("base_pts");
+row["limited_pts"] = dsPeaksDS.getInteger("limited_pts");
+row["points"] = dsPeaksDS.getInteger("points");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsPeaksDS.close();]]></method>
+        </script-data-set>
+        <script-data-set name="dsPeakUsers" id="105">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">peakno</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">peaklabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">userid</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">displayname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">peakno</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">peaklabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">userid</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">displayname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsPeakUsersDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsPeakUsersDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsPeakUsersDS)).peakUsersSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsPeakUsers sql = " + sqlText);
+dsPeakUsersDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsPeakUsersDS.fetch()) return (false);
+row["peakno"] = dsPeakUsersDS.getInteger("peakno");
+row["peaklabel"] = dsPeakUsersDS.getString("peaklabel");
+row["userid"] = dsPeakUsersDS.getString("userid");
+row["displayname"] = dsPeakUsersDS.getString("displayname");
+row["mastype"] = dsPeakUsersDS.getString("mastype");
+row["points"] = dsPeakUsersDS.getInteger("points");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsPeakUsersDS.close();]]></method>
+        </script-data-set>
+        <script-data-set name="dsPremGroups" id="106">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">groupname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">description</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">premium_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">plusapps</property>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">groupname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">description</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">premium_users</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">plusapps</property>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsPremGroupsDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsPremGroupsDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsPremGroupsDS)).premGroupsSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsPremGroups sql = " + sqlText);
+dsPremGroupsDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsPremGroupsDS.fetch()) return (false);
+row["groupname"] = dsPremGroupsDS.getString("groupname");
+row["description"] = dsPremGroupsDS.getString("description");
+row["premium_users"] = dsPremGroupsDS.getInteger("premium_users");
+row["plusapps"] = dsPremGroupsDS.getString("plusapps");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsPremGroupsDS.close();]]></method>
+        </script-data-set>
+        <script-data-set name="dsUsers" id="107">
+            <list-property name="resultSetHints">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">userid</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">displayname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">status</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">type</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">tierlabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">tiersort</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">9</property>
+                    <property name="name">nmod</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">10</property>
+                    <property name="name">restricted</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">11</property>
+                    <property name="name">plusapps</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">12</property>
+                    <property name="name">lastlogin</property>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <structure name="cachedMetaData"><list-property name="resultSet">
+                <structure>
+                    <property name="position">1</property>
+                    <property name="name">userid</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">2</property>
+                    <property name="name">displayname</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">3</property>
+                    <property name="name">status</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">4</property>
+                    <property name="name">type</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">5</property>
+                    <property name="name">mastype</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">6</property>
+                    <property name="name">tierlabel</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">7</property>
+                    <property name="name">tiersort</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">8</property>
+                    <property name="name">points</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">9</property>
+                    <property name="name">nmod</property>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="position">10</property>
+                    <property name="name">restricted</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">11</property>
+                    <property name="name">plusapps</property>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="position">12</property>
+                    <property name="name">lastlogin</property>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property></structure>
+            <property name="dataSource">maximoDataSource</property>
+            <method name="open"><![CDATA[dsUsersDS = MXReportDataSetProvider.create(this.getDataSource().getName(), this.getName());
+dsUsersDS.open();
+var sqlText = magicSql(daysBack, dbKind(dsUsersDS)).usersSql;
+if (scriptLogger.isDebugEnabled()) scriptLogger.debug("dsUsers sql = " + sqlText);
+dsUsersDS.setQuery(sqlText);]]></method>
+            <method name="fetch"><![CDATA[if (!dsUsersDS.fetch()) return (false);
+row["userid"] = dsUsersDS.getString("userid");
+row["displayname"] = dsUsersDS.getString("displayname");
+row["status"] = dsUsersDS.getString("status");
+row["type"] = dsUsersDS.getString("type");
+row["mastype"] = dsUsersDS.getString("mastype");
+row["tierlabel"] = dsUsersDS.getString("tierlabel");
+row["tiersort"] = dsUsersDS.getInteger("tiersort");
+row["points"] = dsUsersDS.getInteger("points");
+row["nmod"] = dsUsersDS.getInteger("nmod");
+row["restricted"] = dsUsersDS.getString("restricted");
+row["plusapps"] = dsUsersDS.getString("plusapps");
+row["lastlogin"] = dsUsersDS.getString("lastlogin");
+return (true);]]></method>
+            <method name="close"><![CDATA[dsUsersDS.close();]]></method>
+        </script-data-set>
+    </data-sets>
+    <styles>
+        <style name="report" id="421">
+            <property name="fontFamily">sans-serif</property>
+            <property name="fontSize">9pt</property>
+            <property name="color">#161616</property>
+        </style>
+    </styles>
+    <page-setup>
+        <simple-master-page name="mxApPage" id="392">
+            <property name="type">us-letter</property>
+            <property name="orientation">landscape</property>
+            <property name="topMargin">0.35in</property>
+            <property name="leftMargin">0.4in</property>
+            <property name="bottomMargin">0.35in</property>
+            <property name="rightMargin">0.4in</property>
+            <page-footer>
+                <grid id="393">
+                    <property name="width">10.1in</property>
+                    <column id="394"><property name="width">8.1in</property></column>
+                    <column id="395"><property name="width">2.0in</property></column>
+                    <row id="396">
+                        <cell id="397"><property name="borderTopColor">#e0e0e0</property><property name="borderTopStyle">solid</property><property name="borderTopWidth">1px</property><property name="paddingTop">3pt</property><label id="398"><property name="fontSize">7pt</property><property name="color">#6f6f6f</property><text-property name="text">MAS AppPoint Estimate - Magic Script 2.6.3 logic, read-only. Estimate, not a licence audit.</text-property></label></cell>
+                        <cell id="399"><property name="borderTopColor">#e0e0e0</property><property name="borderTopStyle">solid</property><property name="borderTopWidth">1px</property><property name="paddingTop">3pt</property><property name="textAlign">right</property>
+                            <grid id="400"><column id="401"/><column id="402"/><column id="403"/><column id="404"/>
+                                <row id="405">
+                                    <cell id="406"><label id="407"><property name="fontSize">7pt</property><property name="color">#6f6f6f</property><property name="textAlign">right</property><text-property name="text">Page</text-property></label></cell>
+                                    <cell id="408"><auto-text id="409"><property name="fontSize">7pt</property><property name="color">#6f6f6f</property><property name="textAlign">center</property><property name="type">page-number</property></auto-text></cell>
+                                    <cell id="410"><label id="411"><property name="fontSize">7pt</property><property name="color">#6f6f6f</property><property name="textAlign">center</property><text-property name="text">of</text-property></label></cell>
+                                    <cell id="412"><auto-text id="413"><property name="fontSize">7pt</property><property name="color">#6f6f6f</property><property name="type">total-page</property></auto-text></cell>
+                                </row></grid>
+                        </cell>
+                    </row>
+                </grid>
+            </page-footer>
+        </simple-master-page>
+    </page-setup>
+    <body>
+        <grid id="108">
+            <property name="width">10.1in</property>
+            <column id="109"><property name="width">7.1in</property></column>
+            <column id="110"><property name="width">3.0in</property></column>
+            <row id="111">
+                <cell id="112"><property name="paddingBottom">4pt</property>
+                    <label id="113"><property name="fontSize">20pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">MAS AppPoint Estimate</text-property></label>
+                    <label id="114"><property name="fontSize">9.5pt</property><property name="color">#525252</property><text-property name="text">Who uses Maximo, which MAS user type each person maps to, and how many AppPoints that costs at peak.</text-property></label>
+                </cell>
+                <cell id="115"><property name="textAlign">right</property><property name="verticalAlign">bottom</property><property name="paddingBottom">4pt</property>
+                    <data id="116"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="textAlign">right</property>
+                        <list-property name="boundDataColumns"><structure><property name="name">run</property>
+                            <expression name="expression" type="javascript"><![CDATA["Run " + Formatter.format(new Date(), "yyyy-MM-dd HH:mm") + "\nPeak window: last " + daysBack + " days" + (ownedAP > 0 ? "\nOwned AppPoints: " + ownedAP : "")]]></expression>
+                            <property name="dataType">string</property></structure></list-property>
+                        <property name="resultSetColumn">run</property>
+                    </data>
+                </cell>
+            </row>
+        </grid>
+        <grid id="117"><property name="width">10.1in</property><column id="118"/><row id="119"><cell id="120"><property name="borderTopColor">#0f62fe</property><property name="borderTopStyle">solid</property><property name="borderTopWidth">1px</property><property name="paddingBottom">8pt</property></cell></row></grid>
+        <table id="145">
+            <property name="width">9.98in</property>
+            <property name="dataSet">dsKpi</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">active_users</property>
+                    <expression name="expression" type="javascript">dataSetRow["active_users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">paying_users</property>
+                    <expression name="expression" type="javascript">dataSetRow["paying_users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">free_users</property>
+                    <expression name="expression" type="javascript">dataSetRow["free_users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">auth_points</property>
+                    <expression name="expression" type="javascript">dataSetRow["auth_points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peak_points</property>
+                    <expression name="expression" type="javascript">dataSetRow["peak_points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peak_users</property>
+                    <expression name="expression" type="javascript">dataSetRow["peak_users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peak_date</property>
+                    <expression name="expression" type="javascript">dataSetRow["peak_date"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">peak_count</property>
+                    <expression name="expression" type="javascript">dataSetRow["peak_count"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">k_paying_sub</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["free_users"] + (row["free_users"] == 1 ? " self-service user is free" : " self-service users are free")]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">k_active_sub</property>
+                    <expression name="expression" type="javascript"><![CDATA["active and blocked user records"]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">k_auth_sub</property>
+                    <expression name="expression" type="javascript"><![CDATA["if every paying user were logged in"]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">k_peak_sub</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["peak_date"] == null ? "no login peaks found" : row["peak_users"] + (row["peak_users"] == 1 ? " user" : " users") + " in session, " + row["peak_date"]]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">k_head</property>
+                    <expression name="expression" type="javascript"><![CDATA[ownedAP > 0 ? ownedAP - row["peak_points"] : null]]></expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">k_head_sub</property>
+                    <expression name="expression" type="javascript"><![CDATA[ownedAP > 0 ? ("of " + ownedAP + " owned, " + Math.round(100 * (ownedAP - row["peak_points"]) / ownedAP) + "% left at peak") : "enter Owned_AppPoints to compare"]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <column id="146"><property name="width">1.9in</property></column><column id="147"><property name="width">0.12in</property></column><column id="148"><property name="width">1.9in</property></column><column id="149"><property name="width">0.12in</property></column><column id="150"><property name="width">1.9in</property></column><column id="151"><property name="width">0.12in</property></column><column id="152"><property name="width">1.9in</property></column><column id="153"><property name="width">0.12in</property></column><column id="154"><property name="width">1.9in</property></column>
+            <detail><row id="155"><cell id="121"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">10pt</property><property name="paddingBottom">10pt</property><property name="paddingLeft">12pt</property><property name="paddingRight">8pt</property><property name="borderLeftColor">#6f6f6f</property><property name="borderLeftStyle">solid</property><property name="borderLeftWidth">4px</property><property name="verticalAlign">top</property><label id="122"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="fontWeight">bold</property><text-property name="text">ACTIVE USERS</text-property></label><data id="123"><property name="fontSize">22pt</property><property name="color">#161616</property><property name="fontWeight">bold</property><property name="fontFamily">sans-serif</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">active_users</property></data><data id="124"><property name="fontSize">7.5pt</property><property name="color">#6f6f6f</property><property name="resultSetColumn">k_active_sub</property></data></cell><cell id="141"/><cell id="125"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">10pt</property><property name="paddingBottom">10pt</property><property name="paddingLeft">12pt</property><property name="paddingRight">8pt</property><property name="borderLeftColor">#0f62fe</property><property name="borderLeftStyle">solid</property><property name="borderLeftWidth">4px</property><property name="verticalAlign">top</property><label id="126"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="fontWeight">bold</property><text-property name="text">PAYING USERS</text-property></label><data id="127"><property name="fontSize">22pt</property><property name="color">#161616</property><property name="fontWeight">bold</property><property name="fontFamily">sans-serif</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">paying_users</property></data><data id="128"><property name="fontSize">7.5pt</property><property name="color">#6f6f6f</property><property name="resultSetColumn">k_paying_sub</property></data></cell><cell id="142"/><cell id="129"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">10pt</property><property name="paddingBottom">10pt</property><property name="paddingLeft">12pt</property><property name="paddingRight">8pt</property><property name="borderLeftColor">#0f62fe</property><property name="borderLeftStyle">solid</property><property name="borderLeftWidth">4px</property><property name="verticalAlign">top</property><label id="130"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="fontWeight">bold</property><text-property name="text">APPPOINTS, ALL USERS</text-property></label><data id="131"><property name="fontSize">22pt</property><property name="color">#161616</property><property name="fontWeight">bold</property><property name="fontFamily">sans-serif</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">auth_points</property></data><data id="132"><property name="fontSize">7.5pt</property><property name="color">#6f6f6f</property><property name="resultSetColumn">k_auth_sub</property></data></cell><cell id="143"/><cell id="133"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">10pt</property><property name="paddingBottom">10pt</property><property name="paddingLeft">12pt</property><property name="paddingRight">8pt</property><property name="borderLeftColor">#8a3ffc</property><property name="borderLeftStyle">solid</property><property name="borderLeftWidth">4px</property><property name="verticalAlign">top</property><label id="134"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="fontWeight">bold</property><text-property name="text">APPPOINTS AT PEAK</text-property></label><data id="135"><property name="fontSize">22pt</property><property name="color">#161616</property><property name="fontWeight">bold</property><property name="fontFamily">sans-serif</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">peak_points</property></data><data id="136"><property name="fontSize">7.5pt</property><property name="color">#6f6f6f</property><property name="resultSetColumn">k_peak_sub</property></data></cell><cell id="144"/><cell id="137"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">10pt</property><property name="paddingBottom">10pt</property><property name="paddingLeft">12pt</property><property name="paddingRight">8pt</property><property name="borderLeftColor">#198038</property><property name="borderLeftStyle">solid</property><property name="borderLeftWidth">4px</property><property name="verticalAlign">top</property><label id="138"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="fontWeight">bold</property><text-property name="text">HEADROOM AT PEAK</text-property></label><data id="139"><property name="fontSize">22pt</property><property name="color">#161616</property><property name="fontWeight">bold</property><property name="fontFamily">sans-serif</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><list-property name="highlightRules">
+                <structure><property name="operator">lt</property><property name="color">#da1e28</property>
+                    <expression name="testExpr" type="javascript">row["k_head"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">0</value></simple-property-list></structure>
+                <structure><property name="operator">ge</property><property name="color">#198038</property>
+                    <expression name="testExpr" type="javascript">row["k_head"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">0</value></simple-property-list></structure>
+            </list-property><property name="resultSetColumn">k_head</property></data><data id="140"><property name="fontSize">7.5pt</property><property name="color">#6f6f6f</property><property name="resultSetColumn">k_head_sub</property></data></cell></row></detail>
+        </table>
+        <grid id="156">
+            <property name="marginTop">14pt</property>
+            <property name="width">10.1in</property>
+            <column id="157"><property name="width">3.2in</property></column>
+            <column id="158"><property name="width">3.2in</property></column>
+            <column id="159"><property name="width">3.7in</property></column>
+            <row id="160">
+                <cell id="161"><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><extended-item extensionName="Chart" name="chart162" id="163">
+                <xml-property name="xmlRepresentation"><![CDATA[<model:ChartWithoutAxes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:attribute="http://www.birt.eclipse.org/ChartModelAttribute" xmlns:data="http://www.birt.eclipse.org/ChartModelData" xmlns:layout="http://www.birt.eclipse.org/ChartModelLayout" xmlns:model="http://www.birt.eclipse.org/ChartModel" xmlns:type="http://www.birt.eclipse.org/ChartModelType"><Version>2.6.1</Version><Type>Pie Chart</Type><SubType>Standard</SubType><Block><Children xsi:type="layout:TitleBlock"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><Label><Caption><Value>Users by MAS type</Value><Font><Name>SansSerif</Name><Size>11.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label></Children><Children xsi:type="layout:Plot"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible><HorizontalSpacing>5</HorizontalSpacing><VerticalSpacing>5</VerticalSpacing><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0</Top><Left>0</Left><Bottom>0</Bottom><Right>0</Right></Insets></ClientArea></Children><Children xsi:type="layout:Legend"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>2</Top><Left>2</Left><Bottom>2</Bottom><Right>2</Right></Insets></ClientArea><Text><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Text><Orientation>Horizontal</Orientation><Direction>Left_Right</Direction><Separator><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>0</Red><Green>0</Green><Blue>0</Blue></Color><Visible>true</Visible></Separator><Position>Below</Position><ItemType>Categories</ItemType><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Above</TitlePosition></Children><Bounds><Left>0.0</Left><Top>0.0</Top><Width>230.0</Width><Height>160.0</Height></Bounds><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible></Block><Dimension>Two_Dimensional</Dimension><Units>Points</Units><SeriesThickness>10.0</SeriesThickness><SampleData><BaseSampleData><DataSetRepresentation>A,B,C,D</DataSetRepresentation></BaseSampleData><OrthogonalSampleData><DataSetRepresentation>4,3,2,1</DataSetRepresentation><SeriesDefinitionIndex>0</SeriesDefinitionIndex></OrthogonalSampleData></SampleData><Interactivity/><EmptyMessage><Caption><Value>No data</Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></EmptyMessage><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>138</Red><Green>63</Green><Blue>252</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>15</Red><Green>98</Green><Blue>254</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>0</Red><Green>157</Green><Blue>154</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Entries></SeriesPalette><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>138</Red><Green>63</Green><Blue>252</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>15</Red><Green>98</Green><Blue>254</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>0</Red><Green>157</Green><Blue>154</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Entries></SeriesPalette><Series xsi:type="type:PieSeries"><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><DataDefinition><Definition>row["users"]</Definition></DataDefinition><SeriesIdentifier>Users</SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Outside</LabelPosition><Stacked>false</Stacked><Triggers><Condition>onmouseover</Condition><Action><Type>Show_Tooltip</Type><Value xsi:type="attribute:TooltipValue"><Text></Text><Delay>200</Delay></Value></Action></Triggers><Explosion>0</Explosion><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Below</TitlePosition><LeaderLineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>141</Red><Green>141</Green><Blue>141</Blue></Color><Visible>true</Visible></LeaderLineAttributes><LeaderLineStyle>Stretch_To_Side</LeaderLineStyle><LeaderLineLength>8.0</LeaderLineLength><SliceOutline><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></SliceOutline><Ratio>1.0</Ratio><Rotation>0.0</Rotation></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><Series><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Label><DataDefinition><Definition>row["label"]</Definition></DataDefinition><SeriesIdentifier></SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Outside</LabelPosition><Stacked>false</Stacked></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><MinSlice>0.0</MinSlice><MinSlicePercent>false</MinSlicePercent><MinSliceLabel></MinSliceLabel></model:ChartWithoutAxes>]]></xml-property>
+                <property name="outputFormat">SVG</property>
+                <property name="inheritColumns">false</property>
+                <property name="height">2.4in</property>
+                <property name="width">3.1in</property>
+                <property name="dataSet">dsTypes</property>
+                <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">mastype</property>
+                    <expression name="expression" type="javascript">dataSetRow["mastype"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">label</property>
+                    <expression name="expression" type="javascript">dataSetRow["label"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">sk</property>
+                    <expression name="expression" type="javascript">dataSetRow["sk"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">pointseach</property>
+                    <expression name="expression" type="javascript">dataSetRow["pointseach"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">users</property>
+                    <expression name="expression" type="javascript">dataSetRow["users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            </extended-item></cell>
+                <cell id="164"><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><extended-item extensionName="Chart" name="chart165" id="166">
+                <xml-property name="xmlRepresentation"><![CDATA[<model:ChartWithoutAxes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:attribute="http://www.birt.eclipse.org/ChartModelAttribute" xmlns:data="http://www.birt.eclipse.org/ChartModelData" xmlns:layout="http://www.birt.eclipse.org/ChartModelLayout" xmlns:model="http://www.birt.eclipse.org/ChartModel" xmlns:type="http://www.birt.eclipse.org/ChartModelType"><Version>2.6.1</Version><Type>Pie Chart</Type><SubType>Standard</SubType><Block><Children xsi:type="layout:TitleBlock"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><Label><Caption><Value>AppPoints by MAS type (authorized)</Value><Font><Name>SansSerif</Name><Size>11.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label></Children><Children xsi:type="layout:Plot"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible><HorizontalSpacing>5</HorizontalSpacing><VerticalSpacing>5</VerticalSpacing><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0</Top><Left>0</Left><Bottom>0</Bottom><Right>0</Right></Insets></ClientArea></Children><Children xsi:type="layout:Legend"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>2</Top><Left>2</Left><Bottom>2</Bottom><Right>2</Right></Insets></ClientArea><Text><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Text><Orientation>Horizontal</Orientation><Direction>Left_Right</Direction><Separator><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>0</Red><Green>0</Green><Blue>0</Blue></Color><Visible>true</Visible></Separator><Position>Below</Position><ItemType>Categories</ItemType><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Above</TitlePosition></Children><Bounds><Left>0.0</Left><Top>0.0</Top><Width>230.0</Width><Height>160.0</Height></Bounds><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible></Block><Dimension>Two_Dimensional</Dimension><Units>Points</Units><SeriesThickness>10.0</SeriesThickness><SampleData><BaseSampleData><DataSetRepresentation>A,B,C,D</DataSetRepresentation></BaseSampleData><OrthogonalSampleData><DataSetRepresentation>4,3,2,1</DataSetRepresentation><SeriesDefinitionIndex>0</SeriesDefinitionIndex></OrthogonalSampleData></SampleData><Interactivity/><EmptyMessage><Caption><Value>No data</Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></EmptyMessage><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>138</Red><Green>63</Green><Blue>252</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>15</Red><Green>98</Green><Blue>254</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>0</Red><Green>157</Green><Blue>154</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Entries></SeriesPalette><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>138</Red><Green>63</Green><Blue>252</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>15</Red><Green>98</Green><Blue>254</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>0</Red><Green>157</Green><Blue>154</Blue></Entries><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Entries></SeriesPalette><Series xsi:type="type:PieSeries"><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><DataDefinition><Definition>row["points"]</Definition></DataDefinition><SeriesIdentifier>AppPoints</SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Outside</LabelPosition><Stacked>false</Stacked><Triggers><Condition>onmouseover</Condition><Action><Type>Show_Tooltip</Type><Value xsi:type="attribute:TooltipValue"><Text></Text><Delay>200</Delay></Value></Action></Triggers><Explosion>0</Explosion><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Below</TitlePosition><LeaderLineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>141</Red><Green>141</Green><Blue>141</Blue></Color><Visible>true</Visible></LeaderLineAttributes><LeaderLineStyle>Stretch_To_Side</LeaderLineStyle><LeaderLineLength>8.0</LeaderLineLength><SliceOutline><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></SliceOutline><Ratio>1.0</Ratio><Rotation>0.0</Rotation></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><Series><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Label><DataDefinition><Definition>row["label"]</Definition></DataDefinition><SeriesIdentifier></SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Outside</LabelPosition><Stacked>false</Stacked></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><MinSlice>0.0</MinSlice><MinSlicePercent>false</MinSlicePercent><MinSliceLabel></MinSliceLabel></model:ChartWithoutAxes>]]></xml-property>
+                <property name="outputFormat">SVG</property>
+                <property name="inheritColumns">false</property>
+                <property name="height">2.4in</property>
+                <property name="width">3.1in</property>
+                <property name="dataSet">dsTypes</property>
+                <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">mastype</property>
+                    <expression name="expression" type="javascript">dataSetRow["mastype"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">label</property>
+                    <expression name="expression" type="javascript">dataSetRow["label"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">sk</property>
+                    <expression name="expression" type="javascript">dataSetRow["sk"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">pointseach</property>
+                    <expression name="expression" type="javascript">dataSetRow["pointseach"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">users</property>
+                    <expression name="expression" type="javascript">dataSetRow["users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            </extended-item></cell>
+                <cell id="167"><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><extended-item extensionName="Chart" name="chart168" id="169">
+                <xml-property name="xmlRepresentation"><![CDATA[<model:ChartWithAxes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:attribute="http://www.birt.eclipse.org/ChartModelAttribute" xmlns:data="http://www.birt.eclipse.org/ChartModelData" xmlns:layout="http://www.birt.eclipse.org/ChartModelLayout" xmlns:model="http://www.birt.eclipse.org/ChartModel" xmlns:type="http://www.birt.eclipse.org/ChartModelType"><Version>2.6.1</Version><Type>Bar Chart</Type><SubType>Stacked</SubType><Block><Children xsi:type="layout:TitleBlock"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><Label><Caption><Value>AppPoints at the 3 peak moments</Value><Font><Name>SansSerif</Name><Size>11.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label></Children><Children xsi:type="layout:Plot"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible><HorizontalSpacing>5</HorizontalSpacing><VerticalSpacing>5</VerticalSpacing><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0</Top><Left>0</Left><Bottom>0</Bottom><Right>0</Right></Insets></ClientArea></Children><Children xsi:type="layout:Legend"><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Visible>true</Visible><ClientArea><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>2</Top><Left>2</Left><Bottom>2</Bottom><Right>2</Right></Insets></ClientArea><Text><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Text><Orientation>Horizontal</Orientation><Direction>Left_Right</Direction><Separator><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>0</Red><Green>0</Green><Blue>0</Blue></Color><Visible>true</Visible></Separator><Position>Below</Position><ItemType>Series</ItemType><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Above</TitlePosition></Children><Bounds><Left>0.0</Left><Top>0.0</Top><Width>230.0</Width><Height>160.0</Height></Bounds><Insets><Top>3</Top><Left>3</Left><Bottom>3</Bottom><Right>3</Right></Insets><Row>-1</Row><Column>-1</Column><Rowspan>-1</Rowspan><Columnspan>-1</Columnspan><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Background xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Visible>true</Visible></Block><Dimension>Two_Dimensional</Dimension><Units>Points</Units><SeriesThickness>10.0</SeriesThickness><SampleData><BaseSampleData><DataSetRepresentation>A,B,C</DataSetRepresentation></BaseSampleData><OrthogonalSampleData><DataSetRepresentation>5,4,12</DataSetRepresentation><SeriesDefinitionIndex>0</SeriesDefinitionIndex></OrthogonalSampleData><OrthogonalSampleData><DataSetRepresentation>5,4,12</DataSetRepresentation><SeriesDefinitionIndex>1</SeriesDefinitionIndex></OrthogonalSampleData><OrthogonalSampleData><DataSetRepresentation>5,4,12</DataSetRepresentation><SeriesDefinitionIndex>2</SeriesDefinitionIndex></OrthogonalSampleData></SampleData><Interactivity/><EmptyMessage><Caption><Value>No login peaks in this window</Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>111</Red><Green>111</Green><Blue>111</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></EmptyMessage><Axes><Type>Text</Type><Title><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Title><TitlePosition>Below</TitlePosition><AssociatedAxes><Type>Linear</Type><Title><Caption><Value>AppPoints</Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment><Rotation>90.0</Rotation></Font><Color><Transparency>255</Transparency><Red>82</Red><Green>82</Green><Blue>82</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Title><TitlePosition>Left</TitlePosition><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>138</Red><Green>63</Green><Blue>252</Blue></Entries></SeriesPalette><Series xsi:type="type:BarSeries"><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><DataDefinition><Definition>row["premium_pts"]</Definition></DataDefinition><SeriesIdentifier>Premium</SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Inside</LabelPosition><Stacked>true</Stacked><Triggers><Condition>onmouseover</Condition><Action><Type>Show_Tooltip</Type><Value xsi:type="attribute:TooltipValue"><Text></Text><Delay>200</Delay></Value></Action></Triggers><Riser>Rectangle</Riser></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>15</Red><Green>98</Green><Blue>254</Blue></Entries></SeriesPalette><Series xsi:type="type:BarSeries"><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><DataDefinition><Definition>row["base_pts"]</Definition></DataDefinition><SeriesIdentifier>Base</SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Inside</LabelPosition><Stacked>true</Stacked><Triggers><Condition>onmouseover</Condition><Action><Type>Show_Tooltip</Type><Value xsi:type="attribute:TooltipValue"><Text></Text><Delay>200</Delay></Value></Action></Triggers><Riser>Rectangle</Riser></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>0</Red><Green>157</Green><Blue>154</Blue></Entries></SeriesPalette><Series xsi:type="type:BarSeries"><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>true</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><DataDefinition><Definition>row["limited_pts"]</Definition></DataDefinition><SeriesIdentifier>Limited</SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Inside</LabelPosition><Stacked>true</Stacked><Triggers><Condition>onmouseover</Condition><Action><Type>Show_Tooltip</Type><Value xsi:type="attribute:TooltipValue"><Text></Text><Delay>200</Delay></Value></Action></Triggers><Riser>Rectangle</Riser></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><Orientation>Vertical</Orientation><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>141</Red><Green>141</Green><Blue>141</Blue></Color><Visible>true</Visible></LineAttributes><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>82</Red><Green>82</Green><Blue>82</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><LabelPosition>Left</LabelPosition><MajorGrid><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>224</Red><Green>224</Green><Blue>224</Blue></Color><Visible>true</Visible></LineAttributes><TickStyle>Across</TickStyle><TickAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>true</Visible></TickAttributes></MajorGrid><MinorGrid><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>244</Red><Green>244</Green><Blue>244</Blue></Color><Visible>false</Visible></LineAttributes><TickStyle>Across</TickStyle><TickAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>244</Red><Green>244</Green><Blue>244</Blue></Color><Visible>false</Visible></TickAttributes></MinorGrid><Scale><Min xsi:type="data:NumberDataElement"><Value>0.0</Value></Min><MinorGridsPerUnit>5</MinorGridsPerUnit></Scale><Origin><Type>Min</Type><Value xsi:type="data:NumberDataElement"><Value>0.0</Value></Value></Origin><PrimaryAxis>true</PrimaryAxis><Percent>false</Percent></AssociatedAxes><SeriesDefinitions><Query><Definition></Definition></Query><SeriesPalette><Entries xsi:type="attribute:ColorDefinition"><Transparency>255</Transparency><Red>141</Red><Green>141</Green><Blue>141</Blue></Entries></SeriesPalette><Series><Visible>true</Visible><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>9.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>22</Red><Green>22</Green><Blue>22</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>false</Visible></Label><DataDefinition><Definition>row["peaklabel"]</Definition></DataDefinition><SeriesIdentifier></SeriesIdentifier><DataPoint><Components><Type>Orthogonal_Value</Type></Components><Separator>, </Separator></DataPoint><LabelPosition>Outside</LabelPosition><Stacked>false</Stacked></Series><Grouping><Enabled>false</Enabled><GroupingInterval>2.0</GroupingInterval><GroupType>Text</GroupType><AggregateExpression>Sum</AggregateExpression></Grouping></SeriesDefinitions><Orientation>Horizontal</Orientation><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>141</Red><Green>141</Green><Blue>141</Blue></Color><Visible>true</Visible></LineAttributes><Label><Caption><Value></Value><Font><Name>SansSerif</Name><Size>8.0</Size><Bold>false</Bold><Alignment><horizontalAlignment>Center</horizontalAlignment><verticalAlignment>Center</verticalAlignment></Alignment></Font><Color><Transparency>255</Transparency><Red>82</Red><Green>82</Green><Blue>82</Blue></Color></Caption><Background xsi:type="attribute:ColorDefinition"><Transparency>0</Transparency><Red>255</Red><Green>255</Green><Blue>255</Blue></Background><Outline><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>false</Visible></Outline><Insets><Top>0.0</Top><Left>2.0</Left><Bottom>0.0</Bottom><Right>3.0</Right></Insets><Visible>true</Visible></Label><LabelPosition>Below</LabelPosition><MajorGrid><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>224</Red><Green>224</Green><Blue>224</Blue></Color><Visible>false</Visible></LineAttributes><TickStyle>Across</TickStyle><TickAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>198</Red><Green>198</Green><Blue>198</Blue></Color><Visible>true</Visible></TickAttributes></MajorGrid><MinorGrid><LineAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>244</Red><Green>244</Green><Blue>244</Blue></Color><Visible>false</Visible></LineAttributes><TickStyle>Across</TickStyle><TickAttributes><Style>Solid</Style><Thickness>1</Thickness><Color><Transparency>255</Transparency><Red>244</Red><Green>244</Green><Blue>244</Blue></Color><Visible>false</Visible></TickAttributes></MinorGrid><Scale><MinorGridsPerUnit>5</MinorGridsPerUnit></Scale><Origin><Type>Min</Type><Value xsi:type="data:NumberDataElement"><Value>0.0</Value></Value></Origin><PrimaryAxis>true</PrimaryAxis><CategoryAxis>true</CategoryAxis><Percent>false</Percent></Axes><Orientation>Vertical</Orientation><UnitSpacing>50.0</UnitSpacing><Rotation/><Script>function beforeDrawDataPointLabel(dph, label, icsc) {
+  var v = dph.getOrthogonalValue();
+  if (v == null || v == 0) label.setVisible(false);
+}
+</Script></model:ChartWithAxes>]]></xml-property>
+                <property name="outputFormat">SVG</property>
+                <property name="inheritColumns">false</property>
+                <property name="height">2.4in</property>
+                <property name="width">3.6in</property>
+                <property name="dataSet">dsPeaks</property>
+                <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">peakno</property>
+                    <expression name="expression" type="javascript">dataSetRow["peakno"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peaklabel</property>
+                    <expression name="expression" type="javascript">dataSetRow["peaklabel"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">peakdate</property>
+                    <expression name="expression" type="javascript">dataSetRow["peakdate"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">currentcount</property>
+                    <expression name="expression" type="javascript">dataSetRow["currentcount"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">users_at_peak</property>
+                    <expression name="expression" type="javascript">dataSetRow["users_at_peak"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">premium</property>
+                    <expression name="expression" type="javascript">dataSetRow["premium"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">base</property>
+                    <expression name="expression" type="javascript">dataSetRow["base"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">limited</property>
+                    <expression name="expression" type="javascript">dataSetRow["limited"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">selfservice</property>
+                    <expression name="expression" type="javascript">dataSetRow["selfservice"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">premium_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["premium_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">base_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["base_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">limited_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["limited_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            </extended-item></cell>
+            </row>
+        </grid><label id="170"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="marginTop">4pt</property><text-property name="text">Definitions of the four MAS user types: Appendix A.   Security groups that make users Premium: Appendix B.</text-property></label><label id="172"><property name="fontSize">13pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">2pt</property><text-property name="text">Peak concurrent usage</text-property></label><label id="171"><property name="fontSize">8.5pt</property><property name="color">#525252</property><property name="marginBottom">6pt</property><text-property name="text">The 3 busiest days in the window, by Maximo's own count of logged-in users. MAS bills concurrent AppPoints at peak, so compare the right-hand column with what you own.</text-property></label>
+        <table id="218">
+            <property name="width">9.00in</property>
+            <property name="dataSet">dsPeaks</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">peakno</property>
+                    <expression name="expression" type="javascript">dataSetRow["peakno"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peaklabel</property>
+                    <expression name="expression" type="javascript">dataSetRow["peaklabel"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">peakdate</property>
+                    <expression name="expression" type="javascript">dataSetRow["peakdate"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">currentcount</property>
+                    <expression name="expression" type="javascript">dataSetRow["currentcount"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">users_at_peak</property>
+                    <expression name="expression" type="javascript">dataSetRow["users_at_peak"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">premium</property>
+                    <expression name="expression" type="javascript">dataSetRow["premium"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">base</property>
+                    <expression name="expression" type="javascript">dataSetRow["base"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">limited</property>
+                    <expression name="expression" type="javascript">dataSetRow["limited"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">selfservice</property>
+                    <expression name="expression" type="javascript">dataSetRow["selfservice"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">premium_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["premium_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">base_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["base_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">limited_pts</property>
+                    <expression name="expression" type="javascript">dataSetRow["limited_pts"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+            </list-property>
+            <property name="pageBreakInterval">0</property>
+            <column id="191"><property name="width">0.5in</property></column><column id="192"><property name="width">1.4in</property></column><column id="193"><property name="width">1.0in</property></column><column id="194"><property name="width">1.1in</property></column><column id="195"><property name="width">0.9in</property></column><column id="196"><property name="width">0.9in</property></column><column id="197"><property name="width">0.9in</property></column><column id="198"><property name="width">1.0in</property></column><column id="199"><property name="width">1.3in</property></column>
+            <header><row id="219"><cell id="200"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="173"><text-property name="text">Peak</text-property></label></cell><cell id="201"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="174"><text-property name="text">First recorded</text-property></label></cell><cell id="202"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="175"><text-property name="text">Maximo count</text-property></label></cell><cell id="203"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="176"><text-property name="text">Users in session</text-property></label></cell><cell id="204"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="177"><text-property name="text">Premium</text-property></label></cell><cell id="205"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="178"><text-property name="text">Base</text-property></label></cell><cell id="206"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="179"><text-property name="text">Limited</text-property></label></cell><cell id="207"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="180"><text-property name="text">Self service</text-property></label></cell><cell id="208"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="181"><text-property name="text">AppPoints at peak</text-property></label></cell></row></header>
+            <detail><row id="220"><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property>
+                    <property name="backgroundColor">#f4f4f4</property>
+                    <expression name="testExpr" type="javascript">row.__rownum % 2</expression>
+                    <simple-property-list name="value1"><value type="javascript">1</value></simple-property-list>
+                </structure>
+            </list-property><cell id="209"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="182"><property name="fontSize">9pt</property><property name="fontWeight">bold</property><property name="resultSetColumn">peakno</property></data></cell><cell id="210"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="183"><property name="fontSize">9pt</property><property name="resultSetColumn">peakdate</property></data></cell><cell id="211"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="184"><property name="fontSize">9pt</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">currentcount</property></data></cell><cell id="212"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="185"><property name="fontSize">9pt</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">users_at_peak</property></data></cell><cell id="213"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="186"><property name="fontSize">9pt</property><property name="color">#8a3ffc</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">premium</property></data></cell><cell id="214"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="187"><property name="fontSize">9pt</property><property name="color">#0f62fe</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">base</property></data></cell><cell id="215"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="188"><property name="fontSize">9pt</property><property name="color">#009d9a</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">limited</property></data></cell><cell id="216"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="189"><property name="fontSize">9pt</property><property name="color">#6f6f6f</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">selfservice</property></data></cell><cell id="217"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="190"><property name="fontSize">11pt</property><property name="fontWeight">bold</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">points</property></data></cell></row></detail>
+        </table><label id="225"><property name="fontSize">13pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">6pt</property><text-property name="text">Who was logged in at each peak</text-property></label>
+        <table id="246">
+            <property name="width">8.20in</property>
+            <property name="dataSet">dsPeakUsers</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">peakno</property>
+                    <expression name="expression" type="javascript">dataSetRow["peakno"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">peaklabel</property>
+                    <expression name="expression" type="javascript">dataSetRow["peaklabel"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">userid</property>
+                    <expression name="expression" type="javascript">dataSetRow["userid"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">displayname</property>
+                    <expression name="expression" type="javascript">dataSetRow["displayname"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">mastype</property>
+                    <expression name="expression" type="javascript">dataSetRow["mastype"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">mt</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["mastype"] == "SELFSERVICE" ? "Self service" : row["mastype"] == "NOT ACTIVE" ? "Not active" : row["mastype"].charAt(0) + row["mastype"].substring(1).toLowerCase()]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <property name="pageBreakInterval">0</property>
+            <column id="234"><property name="width">1.8in</property></column><column id="235"><property name="width">3.6in</property></column><column id="236"><property name="width">1.6in</property></column><column id="237"><property name="width">1.2in</property></column>
+            <header><row id="247"><cell id="238"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="226"><text-property name="text">User</text-property></label></cell><cell id="239"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="227"><text-property name="text">Name</text-property></label></cell><cell id="240"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="228"><text-property name="text">MAS type</text-property></label></cell><cell id="241"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="229"><text-property name="text">AppPoints</text-property></label></cell></row></header>
+            <group id="221">
+                <property name="groupName">grpPeak</property>
+                <expression name="keyExpr" type="javascript">row["peakno"]</expression>
+                <structure name="toc"/>
+                <property name="hideDetail">false</property>
+                <header><row id="222">
+                    <cell id="223"><property name="backgroundColor">#f4f4f4</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="colSpan">4</property><data id="224"><property name="fontSize">9pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="resultSetColumn">peaklabel</property></data></cell>
+                </row></header>
+            </group>
+            <detail><row id="248"><cell id="242"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="230"><property name="fontSize">8.5pt</property><property name="resultSetColumn">userid</property></data></cell><cell id="243"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="231"><property name="fontSize">8.5pt</property><property name="resultSetColumn">displayname</property></data></cell><cell id="244"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="232"><property name="fontSize">8.5pt</property><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property><property name="color">#8a3ffc</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"PREMIUM"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#0f62fe</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"BASE"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#009d9a</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"LIMITED"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#6f6f6f</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"SELFSERVICE"</value></simple-property-list>
+                </structure></list-property><property name="resultSetColumn">mt</property></data></cell><cell id="245"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="233"><property name="fontSize">8.5pt</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">points</property></data></cell></row></detail>
+        </table><label id="254"><property name="fontSize">13pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">2pt</property><text-property name="text">All active users by MAS type</text-property></label><label id="253"><property name="fontSize">8.5pt</property><property name="color">#525252</property><property name="marginBottom">6pt</property><text-property name="text">Sorted by type, then user. "Modules" counts modules with create rights (Work Orders excluded). "Admin apps" means save rights in Security, System Configuration, Integration, Utilities or Scheduler.</text-property></label>
+        <table id="264">
+            <property name="width">10.10in</property>
+            <property name="dataSet">dsUsers</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">userid</property>
+                    <expression name="expression" type="javascript">dataSetRow["userid"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">displayname</property>
+                    <expression name="expression" type="javascript">dataSetRow["displayname"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">status</property>
+                    <expression name="expression" type="javascript">dataSetRow["status"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">type</property>
+                    <expression name="expression" type="javascript">dataSetRow["type"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">mastype</property>
+                    <expression name="expression" type="javascript">dataSetRow["mastype"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">tierlabel</property>
+                    <expression name="expression" type="javascript">dataSetRow["tierlabel"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">tiersort</property>
+                    <expression name="expression" type="javascript">dataSetRow["tiersort"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">nmod</property>
+                    <expression name="expression" type="javascript">dataSetRow["nmod"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">restricted</property>
+                    <expression name="expression" type="javascript">dataSetRow["restricted"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">plusapps</property>
+                    <expression name="expression" type="javascript">dataSetRow["plusapps"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">lastlogin</property>
+                    <expression name="expression" type="javascript">dataSetRow["lastlogin"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">lastlogin_txt</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["lastlogin"] == null ? "never" : row["lastlogin"]]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">admin_txt</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["restricted"] == "Y" ? "yes" : ""]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">g_title</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["tierlabel"] + "  -  " + row["g_count"] + (row["g_count"] == 1 ? " user, " : " users, ") + row["g_points"] + " AppPoints if all authorized"]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">g_count</property>
+                    <property name="dataType">integer</property>
+                    <simple-property-list name="aggregateOn"><value>grpTier</value></simple-property-list>
+                    <property name="aggregateFunction">COUNT</property>
+                    <list-property name="arguments"><structure><property name="name">Expression</property>
+                        <expression name="value" type="javascript">row["userid"]</expression></structure></list-property>
+                </structure>
+                <structure>
+                    <property name="name">g_points</property>
+                    <property name="dataType">integer</property>
+                    <simple-property-list name="aggregateOn"><value>grpTier</value></simple-property-list>
+                    <property name="aggregateFunction">SUM</property>
+                    <list-property name="arguments"><structure><property name="name">Expression</property>
+                        <expression name="value" type="javascript">row["points"]</expression></structure></list-property>
+                </structure>
+            </list-property>
+            <property name="pageBreakInterval">0</property>
+            <column id="265"><property name="width">1.1in</property></column><column id="266"><property name="width">2.0in</property></column><column id="267"><property name="width">0.8in</property></column><column id="268"><property name="width">0.95in</property></column><column id="269"><property name="width">0.7in</property></column><column id="270"><property name="width">0.65in</property></column><column id="271"><property name="width">0.65in</property></column><column id="272"><property name="width">0.8in</property></column><column id="273"><property name="width">2.45in</property></column>
+            <header><row id="274"><cell id="275"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="276"><text-property name="text">User</text-property></label></cell><cell id="277"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="278"><text-property name="text">Name</text-property></label></cell><cell id="279"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="280"><text-property name="text">Maximo type</text-property></label></cell><cell id="281"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="282"><text-property name="text">MAS type</text-property></label></cell><cell id="283"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="284"><text-property name="text">AppPoints</text-property></label></cell><cell id="285"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="286"><text-property name="text">Modules</text-property></label></cell><cell id="287"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="288"><text-property name="text">Admin apps</text-property></label></cell><cell id="289"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="290"><text-property name="text">Last login</text-property></label></cell><cell id="291"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="292"><text-property name="text">Add-on (PLUS*) apps with create rights</text-property></label></cell></row></header>
+            
+            <group id="249">
+                <property name="groupName">grpTier</property>
+                <expression name="keyExpr" type="javascript">row["tiersort"]</expression>
+                <structure name="toc"><expression name="expressionValue" type="javascript">row["tierlabel"]</expression></structure>
+                <header><row id="250">
+                    <list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#8a3ffc</property><property name="color">#ffffff</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"PREMIUM"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#0f62fe</property><property name="color">#ffffff</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"BASE"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#009d9a</property><property name="color">#ffffff</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"LIMITED"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#6f6f6f</property><property name="color">#ffffff</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"SELFSERVICE"</value></simple-property-list>
+                </structure></list-property>
+                    <cell id="251"><property name="paddingTop">5pt</property><property name="paddingBottom">5pt</property><property name="paddingLeft">6pt</property><property name="colSpan">9</property>
+                        <data id="252"><property name="fontSize">10pt</property><property name="fontWeight">bold</property>
+                            <property name="resultSetColumn">g_title</property></data></cell>
+                </row></header>
+            </group>
+            <detail><row id="293"><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property>
+                    <property name="backgroundColor">#f4f4f4</property>
+                    <expression name="testExpr" type="javascript">row.__rownum % 2</expression>
+                    <simple-property-list name="value1"><value type="javascript">1</value></simple-property-list>
+                </structure>
+            </list-property><cell id="294"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="255"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="resultSetColumn">userid</property></data></cell><cell id="295"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="256"><property name="fontSize">8pt</property><property name="resultSetColumn">displayname</property></data></cell><cell id="296"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="257"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="resultSetColumn">type</property></data></cell><cell id="297"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="258"><property name="fontSize">8pt</property><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property><property name="color">#8a3ffc</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"PREMIUM"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#0f62fe</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"BASE"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#009d9a</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"LIMITED"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#6f6f6f</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"SELFSERVICE"</value></simple-property-list>
+                </structure></list-property><property name="resultSetColumn">tierlabel</property></data></cell><cell id="298"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="259"><property name="fontSize">8pt</property><property name="textAlign">center</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">points</property></data></cell><cell id="299"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="260"><property name="fontSize">8pt</property><property name="textAlign">center</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">nmod</property></data></cell><cell id="300"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="261"><property name="fontSize">8pt</property><property name="textAlign">center</property><property name="color">#da1e28</property><property name="resultSetColumn">admin_txt</property></data></cell><cell id="301"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="262"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="resultSetColumn">lastlogin_txt</property></data></cell><cell id="302"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="263"><property name="fontSize">7pt</property><property name="color">#525252</property><property name="resultSetColumn">plusapps</property></data></cell></row></detail>
+        </table><label id="304"><property name="fontSize">13pt</property><property name="pageBreakBefore">always</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">2pt</property><text-property name="text">Appendix A - The four MAS user types</text-property></label><label id="303"><property name="fontSize">8.5pt</property><property name="color">#525252</property><property name="marginBottom">6pt</property><text-property name="text">Each active user is placed in exactly one type from their security-group rights. The type sets the AppPoints the user costs while logged in.</text-property></label>
+        <table id="335">
+            <property name="width">10.10in</property>
+            <property name="dataSet">dsTypes</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">mastype</property>
+                    <expression name="expression" type="javascript">dataSetRow["mastype"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">label</property>
+                    <expression name="expression" type="javascript">dataSetRow["label"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">sk</property>
+                    <expression name="expression" type="javascript">dataSetRow["sk"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">pointseach</property>
+                    <expression name="expression" type="javascript">dataSetRow["pointseach"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">users</property>
+                    <expression name="expression" type="javascript">dataSetRow["users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">points</property>
+                    <expression name="expression" type="javascript">dataSetRow["points"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">what</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["mastype"] == "PREMIUM" ? "Would be Base, and can also create records in at least one add-on or industry-solution application (application names starting PLUS: HSE, Transportation, Asset Configuration Manager, Spatial, Service Provider and similar)." : row["mastype"] == "BASE" ? "Can create records in more than 3 modules (Work Orders are not counted), or can save in an administrative module: Security, System Configuration, Integration, Utilities or Scheduler." : row["mastype"] == "LIMITED" ? "Can create records in up to 3 modules (Work Orders are not counted) and has no administrative applications." : row["mastype"] == "SELFSERVICE" ? "Only uses self-service applications: create and view service requests, Start Center, bulletin board, KPIs and reports. No read access to any other module." : ""]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">reduce</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["mastype"] == "PREMIUM" ? "Give read-only access to add-on apps for people who only look. Keep create rights on PLUS apps in a small, dedicated group. Appendix B shows where to start." : row["mastype"] == "BASE" ? "Split broad groups so day-to-day users create in 3 modules or fewer, and keep admin applications in admin-only groups." : row["mastype"] == "LIMITED" ? "Already the lowest paid tier. Check that each Limited user still needs to log in at all." : row["mastype"] == "SELFSERVICE" ? "Nothing to do. Self-service users do not consume AppPoints." : ""]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">share</property>
+                    <expression name="expression" type="javascript"><![CDATA[row["users"] + " users"]]></expression>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <property name="pageBreakInterval">0</property>
+            <column id="317"><property name="width">1.1in</property></column><column id="318"><property name="width">0.8in</property></column><column id="319"><property name="width">0.6in</property></column><column id="320"><property name="width">1.0in</property></column><column id="321"><property name="width">3.5in</property></column><column id="322"><property name="width">3.1in</property></column>
+            <header><row id="336"><cell id="323"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="305"><text-property name="text">Type</text-property></label></cell><cell id="324"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="306"><text-property name="text">AppPoints each</text-property></label></cell><cell id="325"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="307"><text-property name="text">Users</text-property></label></cell><cell id="326"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="308"><text-property name="text">AppPoints (all authorized)</text-property></label></cell><cell id="327"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="309"><text-property name="text">Who lands here</text-property></label></cell><cell id="328"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="310"><text-property name="text">How to lower it</text-property></label></cell></row></header>
+            <detail><row id="337"><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#f6f2ff</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"PREMIUM"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#edf5ff</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"BASE"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#e8f8f7</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"LIMITED"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="backgroundColor">#f4f4f4</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"SELFSERVICE"</value></simple-property-list>
+                </structure></list-property><cell id="329"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="311"><property name="fontSize">10pt</property><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property><property name="color">#8a3ffc</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"PREMIUM"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#0f62fe</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"BASE"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#009d9a</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"LIMITED"</value></simple-property-list>
+                </structure>
+                <structure>
+                    <property name="operator">eq</property><property name="color">#6f6f6f</property><property name="fontWeight">bold</property>
+                    <expression name="testExpr" type="javascript">row["mastype"]</expression>
+                    <simple-property-list name="value1"><value type="javascript">"SELFSERVICE"</value></simple-property-list>
+                </structure></list-property><property name="resultSetColumn">label</property></data></cell><cell id="330"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="312"><property name="fontSize">10pt</property><property name="fontWeight">bold</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">pointseach</property></data></cell><cell id="331"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="313"><property name="fontSize">10pt</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">users</property></data></cell><cell id="332"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="314"><property name="fontSize">10pt</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">points</property></data></cell><cell id="333"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="315"><property name="fontSize">8pt</property><property name="color">#161616</property><property name="resultSetColumn">what</property></data></cell><cell id="334"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="316"><property name="fontSize">8pt</property><property name="color">#525252</property><property name="resultSetColumn">reduce</property></data></cell></row></detail>
+        </table><label id="339"><property name="fontSize">13pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">2pt</property><text-property name="text">Appendix B - Security groups driving Premium</text-property></label><label id="338"><property name="fontSize">8.5pt</property><property name="color">#525252</property><property name="marginBottom">6pt</property><text-property name="text">Groups that give Premium users create rights in add-on (PLUS*) applications, by number of Premium members. Changing a group here moves every member it affects.</text-property></label>
+        <table id="360">
+            <property name="width">10.10in</property>
+            <property name="dataSet">dsPremGroups</property>
+            <list-property name="boundDataColumns">
+                <structure>
+                    <property name="name">groupname</property>
+                    <expression name="expression" type="javascript">dataSetRow["groupname"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">description</property>
+                    <expression name="expression" type="javascript">dataSetRow["description"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+                <structure>
+                    <property name="name">premium_users</property>
+                    <expression name="expression" type="javascript">dataSetRow["premium_users"]</expression>
+                    <property name="dataType">integer</property>
+                </structure>
+                <structure>
+                    <property name="name">plusapps</property>
+                    <expression name="expression" type="javascript">dataSetRow["plusapps"]</expression>
+                    <property name="dataType">string</property>
+                </structure>
+            </list-property>
+            <property name="pageBreakInterval">0</property>
+            <column id="348"><property name="width">1.6in</property></column><column id="349"><property name="width">2.6in</property></column><column id="350"><property name="width">1.0in</property></column><column id="351"><property name="width">4.9in</property></column>
+            <header><row id="361"><cell id="352"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="340"><text-property name="text">Security group</text-property></label></cell><cell id="353"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="341"><text-property name="text">Description</text-property></label></cell><cell id="354"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="342"><text-property name="text">Premium members</text-property></label></cell><cell id="355"><property name="backgroundColor">#161616</property><property name="color">#ffffff</property><property name="fontWeight">bold</property><property name="fontSize">8pt</property><property name="paddingTop">4pt</property><property name="paddingBottom">4pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><label id="343"><text-property name="text">Add-on apps with create rights</text-property></label></cell></row></header>
+            <detail><row id="362"><list-property name="highlightRules">
+                <structure>
+                    <property name="operator">eq</property>
+                    <property name="backgroundColor">#f4f4f4</property>
+                    <expression name="testExpr" type="javascript">row.__rownum % 2</expression>
+                    <simple-property-list name="value1"><value type="javascript">1</value></simple-property-list>
+                </structure>
+            </list-property><cell id="356"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="344"><property name="fontSize">8.5pt</property><property name="fontWeight">bold</property><property name="resultSetColumn">groupname</property></data></cell><cell id="357"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="345"><property name="fontSize">8.5pt</property><property name="resultSetColumn">description</property></data></cell><cell id="358"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="346"><property name="fontSize">8.5pt</property><property name="textAlign">center</property><structure name="numberFormat"><property name="category">Custom</property><property name="pattern">#,##0</property></structure><property name="resultSetColumn">premium_users</property></data></cell><cell id="359"><property name="paddingTop">3pt</property><property name="paddingBottom">3pt</property><property name="paddingLeft">5pt</property><property name="paddingRight">5pt</property><property name="verticalAlign">top</property><property name="borderBottomColor">#e0e0e0</property><property name="borderBottomStyle">solid</property><property name="borderBottomWidth">1px</property><data id="347"><property name="fontSize">7.5pt</property><property name="color">#525252</property><property name="resultSetColumn">plusapps</property></data></cell></row></detail>
+        </table><label id="363"><property name="fontSize">13pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><property name="marginTop">18pt</property><property name="marginBottom">6pt</property><text-property name="text">Appendix C - Method and limits</text-property></label><grid id="389"><property name="width">10.1in</property>
+            <column id="390"><property name="width">1.7in</property></column><column id="391"><property name="width">8.4in</property></column><row id="364"><cell id="365"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="366"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">How this is calculated</text-property></label></cell>
+                <cell id="367"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="368"><property name="fontSize">8pt</property><property name="color">#525252</property><text-property name="text">The rules of IBM's Magic Script 2.6.3, run as read-only queries: no tables or indexes are created. Only security groups (GROUPUSER, APPLICATIONAUTH, MAXMENU) and login history (LOGINTRACKING) are read.</text-property></label></cell></row><row id="369"><cell id="370"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="371"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">AppPoints per user</text-property></label></cell>
+                <cell id="372"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="373"><property name="fontSize">8pt</property><property name="color">#525252</property><text-property name="text">Self service 0, Limited 5, Base 10, Premium 15 - the rates the Magic Script uses.</text-property></label></cell></row><row id="374"><cell id="375"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="376"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">All users vs at peak</text-property></label></cell>
+                <cell id="377"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="378"><property name="fontSize">8pt</property><property name="color">#525252</property><text-property name="text">"All users" counts every paying user at once. "At peak" counts only the users in session at the busiest moment, which is what concurrent AppPoints are measured against.</text-property></label></cell></row><row id="379"><cell id="380"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="381"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">Peaks</text-property></label></cell>
+                <cell id="382"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="383"><property name="fontSize">8pt</property><property name="color">#525252</property><text-property name="text">Taken from LOGINTRACKING.CURRENTCOUNT, which Maximo records at most every 15 minutes, so the real peak can be slightly higher. Login tracking must be switched on. MAXADMIN, MXINTADM and MAXREG are left out of peak sessions, as in the original script.</text-property></label></cell></row><row id="384"><cell id="385"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="386"><property name="fontSize">8pt</property><property name="fontWeight">bold</property><property name="color">#161616</property><text-property name="text">Not included</text-property></label></cell>
+                <cell id="387"><property name="paddingTop">2pt</property><property name="paddingBottom">2pt</property><label id="388"><property name="fontSize">8pt</property><property name="color">#525252</property><text-property name="text">Add-on install charges (for example Spatial) and anything outside Manage. This is an estimate, not an IBM licence audit.</text-property></label></cell></row></grid>
+    </body>
+</report>
