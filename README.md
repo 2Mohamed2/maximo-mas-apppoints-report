@@ -38,10 +38,12 @@ One file covers Oracle, SQL Server and DB2. Each data set reads the database pro
 | Database | User types match IBM's Magic Script | All report queries run | Run inside Maximo 7.6 |
 |---|---|---|---|
 | Oracle | yes (114 of 114 demo users) | yes | yes |
-| SQL Server | yes (88 of 88 demo users) | yes | not yet tested |
-| DB2 | yes (128 of 128 demo users) | yes | not yet tested |
+| SQL Server | yes (88 of 88 demo users) | yes | yes |
+| DB2 | yes (128 of 128 demo users) | yes | yes |
 
-If you run it on SQL Server or DB2, feedback is welcome through an issue.
+Each database was tested inside Maximo 7.6.1 (import, Generate Request Page, Preview). On a SQL Server and a DB2 Maximo built from the same demo data, the report returns the same figures.
+
+If it fails on your system, please open an issue with the database version and the error.
 
 ## How the user type is decided
 
